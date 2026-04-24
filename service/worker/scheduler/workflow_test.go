@@ -925,3 +925,156 @@ func TestBuildScheduleSearchAttributes(t *testing.T) {
 		})
 	}
 }
+
+func TestEnqueueBufferedFire(t *testing.T) {
+	t0 := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name            string
+		bufferLimit     int32
+		initialFires    []BufferedFire
+		initialSkipped  int64
+		enqueueTime     time.Time
+		trigger         TriggerSource
+		wantFires       []BufferedFire
+		wantSkippedRuns int64
+	}{
+		{
+			name:         "unlimited buffer accepts fire when bufferLimit=0",
+			bufferLimit:  0,
+			initialFires: []BufferedFire{{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule}},
+			enqueueTime:  t0.Add(time.Minute),
+			trigger:      TriggerSourceSchedule,
+			wantFires: []BufferedFire{
+				{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule},
+				{ScheduledTime: t0.Add(time.Minute), TriggerSource: TriggerSourceSchedule},
+			},
+		},
+		{
+			name:        "enqueue below limit appends to tail",
+			bufferLimit: 3,
+			initialFires: []BufferedFire{
+				{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule},
+				{ScheduledTime: t0.Add(time.Minute), TriggerSource: TriggerSourceSchedule},
+			},
+			enqueueTime: t0.Add(2 * time.Minute),
+			trigger:     TriggerSourceSchedule,
+			wantFires: []BufferedFire{
+				{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule},
+				{ScheduledTime: t0.Add(time.Minute), TriggerSource: TriggerSourceSchedule},
+				{ScheduledTime: t0.Add(2 * time.Minute), TriggerSource: TriggerSourceSchedule},
+			},
+		},
+		{
+			name:        "enqueue at limit drops fire and increments SkippedRuns",
+			bufferLimit: 2,
+			initialFires: []BufferedFire{
+				{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule},
+				{ScheduledTime: t0.Add(time.Minute), TriggerSource: TriggerSourceSchedule},
+			},
+			initialSkipped: 5,
+			enqueueTime:    t0.Add(2 * time.Minute),
+			trigger:        TriggerSourceSchedule,
+			// Buffer unchanged (limit was 2, already at 2).
+			wantFires: []BufferedFire{
+				{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule},
+				{ScheduledTime: t0.Add(time.Minute), TriggerSource: TriggerSourceSchedule},
+			},
+			wantSkippedRuns: 6,
+		},
+		{
+			name:         "backfill trigger source is preserved",
+			bufferLimit:  0,
+			initialFires: nil,
+			enqueueTime:  t0,
+			trigger:      TriggerSourceBackfill,
+			wantFires: []BufferedFire{
+				{ScheduledTime: t0, TriggerSource: TriggerSourceBackfill},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := &SchedulerWorkflowInput{
+				Policies: types.SchedulePolicies{BufferLimit: tt.bufferLimit},
+			}
+			state := &SchedulerWorkflowState{
+				BufferedFires: append([]BufferedFire(nil), tt.initialFires...),
+				SkippedRuns:   tt.initialSkipped,
+			}
+			enqueueBufferedFire(testLogger, input, state, tt.enqueueTime, tt.trigger)
+			assert.Equal(t, tt.wantFires, state.BufferedFires)
+			assert.Equal(t, tt.wantSkippedRuns, state.SkippedRuns)
+		})
+	}
+}
+
+func TestHandleUpdate_BufferedFiresClearedOnOverlapPolicyChange(t *testing.T) {
+	t0 := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
+	initialFires := []BufferedFire{
+		{ScheduledTime: t0, TriggerSource: TriggerSourceSchedule},
+		{ScheduledTime: t0.Add(time.Minute), TriggerSource: TriggerSourceSchedule},
+	}
+
+	tests := []struct {
+		name            string
+		fromOverlap     types.ScheduleOverlapPolicy
+		toOverlap       types.ScheduleOverlapPolicy
+		initialFires    []BufferedFire
+		wantFiresLen    int
+		wantSkippedRuns int64
+	}{
+		{
+			name:            "BUFFER -> SKIP_NEW clears queue and counts drops as skipped",
+			fromOverlap:     types.ScheduleOverlapPolicyBuffer,
+			toOverlap:       types.ScheduleOverlapPolicySkipNew,
+			initialFires:    initialFires,
+			wantFiresLen:    0,
+			wantSkippedRuns: 2,
+		},
+		{
+			name:            "BUFFER -> TERMINATE_PREVIOUS clears queue",
+			fromOverlap:     types.ScheduleOverlapPolicyBuffer,
+			toOverlap:       types.ScheduleOverlapPolicyTerminatePrevious,
+			initialFires:    initialFires,
+			wantFiresLen:    0,
+			wantSkippedRuns: 2,
+		},
+		{
+			name:         "BUFFER -> BUFFER preserves queue (no-op policy change)",
+			fromOverlap:  types.ScheduleOverlapPolicyBuffer,
+			toOverlap:    types.ScheduleOverlapPolicyBuffer,
+			initialFires: initialFires,
+			wantFiresLen: 2,
+		},
+		{
+			name:         "SKIP_NEW -> BUFFER leaves queue unchanged (was already empty)",
+			fromOverlap:  types.ScheduleOverlapPolicySkipNew,
+			toOverlap:    types.ScheduleOverlapPolicyBuffer,
+			initialFires: nil,
+			wantFiresLen: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := &SchedulerWorkflowInput{
+				Spec:     types.ScheduleSpec{CronExpression: "0 * * * *"},
+				Policies: types.SchedulePolicies{OverlapPolicy: tt.fromOverlap},
+			}
+			state := &SchedulerWorkflowState{
+				BufferedFires: append([]BufferedFire(nil), tt.initialFires...),
+			}
+			sig := UpdateSignal{
+				Policies: &types.SchedulePolicies{OverlapPolicy: tt.toOverlap},
+			}
+
+			changed := handleUpdate(testLogger, sig, input, state)
+
+			assert.True(t, changed, "policy change should always report as changed")
+			assert.Equal(t, tt.toOverlap, input.Policies.OverlapPolicy)
+			assert.Len(t, state.BufferedFires, tt.wantFiresLen)
+			assert.Equal(t, tt.wantSkippedRuns, state.SkippedRuns)
+		})
+	}
+}

@@ -96,12 +96,27 @@ type SchedulerWorkflowState struct {
 	MissedRuns        int64             `json:"missedRuns"`
 	SkippedRuns       int64             `json:"skippedRuns"`
 	Iterations        int               `json:"iterations"`
-	BufferedRuns      int               `json:"bufferedRuns"`
 	PendingBackfills  []BackfillRequest `json:"pendingBackfills,omitempty"`
+	// BufferedFires holds fires queued for sequential execution under the BUFFER
+	// overlap policy. Fires are appended when the previous target workflow is
+	// still running at fire time and drained in FIFO order on subsequent
+	// opportunities (timer wakeups, signal wakeups). Persisted across
+	// ContinueAsNew so buffered work isn't lost on workflow recycling.
+	BufferedFires []BufferedFire `json:"bufferedFires,omitempty"`
 	// LastStartedWorkflow tracks the most recently started target workflow so
 	// the overlap policy can check whether it is still running before starting
 	// the next one. Nil when no workflow has been started yet.
 	LastStartedWorkflow *RunningWorkflowInfo `json:"lastStartedWorkflow,omitempty"`
+}
+
+// BufferedFire represents a schedule fire that has been queued for later
+// sequential execution by the BUFFER overlap policy. The scheduled time is
+// preserved so that the eventual target workflow keeps its original workflow
+// ID (derived from scheduledTime) and RequestID (derived from scheduledTime +
+// triggerSource), matching the non-BUFFER semantics.
+type BufferedFire struct {
+	ScheduledTime time.Time     `json:"scheduledTime"`
+	TriggerSource TriggerSource `json:"triggerSource"`
 }
 
 // RunningWorkflowInfo identifies a target workflow started by the scheduler,
@@ -195,4 +210,9 @@ type ProcessFireResult struct {
 	StartedWorkflow *RunningWorkflowInfo `json:"startedWorkflow,omitempty"`
 	TotalDelta      int64                `json:"totalDelta"`
 	SkippedDelta    int64                `json:"skippedDelta"`
+	// Buffered is true when the BUFFER overlap policy deferred this fire
+	// because the previous target workflow was still running. The workflow
+	// appends the fire to state.BufferedFires and retries draining on the
+	// next loop iteration.
+	Buffered bool `json:"buffered,omitempty"`
 }

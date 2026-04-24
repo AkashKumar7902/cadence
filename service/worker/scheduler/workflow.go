@@ -156,6 +156,13 @@ func SchedulerWorkflow(ctx workflow.Context, input SchedulerWorkflowInput) error
 			return nil
 		}
 
+		// Drain any fires previously buffered under the BUFFER overlap policy
+		// before handling the current fire. Drain stops as soon as one fire
+		// re-buffers (previous still running), preserving FIFO order.
+		if !state.Paused {
+			drainBufferedFires(ctx, logger, &input, state)
+		}
+
 		if timerFired && !state.Paused {
 			processScheduleFire(ctx, logger, &input, state, state.NextRunTime, TriggerSourceSchedule)
 		}
@@ -367,8 +374,23 @@ func handleUpdate(logger *zap.Logger, sig UpdateSignal, input *SchedulerWorkflow
 		changed = true
 	}
 	if sig.Policies != nil {
+		previousOverlap := input.Policies.OverlapPolicy
 		input.Policies = *sig.Policies
 		changed = true
+		// Drop any buffered fires if the overlap policy moved away from BUFFER.
+		// Mixing semantics (queued fires under BUFFER draining under SKIP_NEW,
+		// CANCEL_PREVIOUS, etc.) is confusing and error-prone, so we mirror the
+		// "spec change clears pending backfills" pattern and drop them explicitly.
+		if previousOverlap == types.ScheduleOverlapPolicyBuffer &&
+			input.Policies.OverlapPolicy != types.ScheduleOverlapPolicyBuffer &&
+			len(state.BufferedFires) > 0 {
+			logger.Warn("overlap policy change cleared buffered fires",
+				zap.String("from", previousOverlap.String()),
+				zap.String("to", input.Policies.OverlapPolicy.String()),
+				zap.Int("clearedCount", len(state.BufferedFires)))
+			state.SkippedRuns += int64(len(state.BufferedFires))
+			state.BufferedFires = nil
+		}
 	}
 	if changed {
 		logger.Info("schedule updated")
@@ -422,8 +444,40 @@ func handleBackfill(logger *zap.Logger, sig BackfillSignal, state *SchedulerWork
 // All side effects (overlap check, cancel/terminate, start) are encapsulated in
 // a single activity so that the overlap logic can evolve without introducing
 // nondeterminism in the workflow history.
+//
+// Under the BUFFER overlap policy, if the previous target workflow is still
+// running the activity returns result.Buffered=true. In that case the fire is
+// appended to state.BufferedFires (subject to BufferLimit) and will be retried
+// on the next loop iteration by drainBufferedFires.
 func processScheduleFire(ctx workflow.Context, logger *zap.Logger, input *SchedulerWorkflowInput, state *SchedulerWorkflowState, scheduledTime time.Time, trigger TriggerSource) {
-	state.LastRunTime = scheduledTime
+	switch tryStartFire(ctx, logger, input, state, scheduledTime, trigger) {
+	case fireOutcomeBuffered:
+		enqueueBufferedFire(logger, input, state, scheduledTime, trigger)
+	}
+}
+
+type fireOutcome int
+
+const (
+	// fireOutcomeDone means the fire was processed to completion (started, skipped,
+	// cancelled/terminated-then-started, already-running, or errored-and-logged).
+	fireOutcomeDone fireOutcome = iota
+	// fireOutcomeBuffered means the BUFFER overlap policy deferred the fire
+	// because the previous target workflow is still running.
+	fireOutcomeBuffered
+)
+
+// tryStartFire runs the scheduler activity for a single fire and applies the
+// result to state, returning whether the fire was buffered. This is shared
+// between the "live fire" and "drain buffered fire" code paths; the caller
+// decides how to handle a buffered outcome (enqueue vs. leave-at-head).
+func tryStartFire(ctx workflow.Context, logger *zap.Logger, input *SchedulerWorkflowInput, state *SchedulerWorkflowState, scheduledTime time.Time, trigger TriggerSource) fireOutcome {
+	// Keep LastRunTime monotonically increasing. This matters for BUFFER, where
+	// an older queued fire can drain after a newer fire was already processed;
+	// without the clamp, LastRunTime would regress to the older scheduledTime.
+	if scheduledTime.After(state.LastRunTime) {
+		state.LastRunTime = scheduledTime
+	}
 
 	logger.Info("schedule fired",
 		zap.Time("scheduledTime", scheduledTime),
@@ -432,7 +486,7 @@ func processScheduleFire(ctx workflow.Context, logger *zap.Logger, input *Schedu
 	if input.Action.StartWorkflow == nil {
 		state.MissedRuns++
 		logger.Error("schedule action has no StartWorkflow configuration")
-		return
+		return fireOutcomeDone
 	}
 
 	actCtx := workflow.WithLocalActivityOptions(ctx, defaultActivityOptions())
@@ -454,7 +508,11 @@ func processScheduleFire(ctx workflow.Context, logger *zap.Logger, input *Schedu
 			zap.Time("scheduledTime", scheduledTime),
 			zap.Error(err),
 		)
-		return
+		return fireOutcomeDone
+	}
+
+	if result.Buffered {
+		return fireOutcomeBuffered
 	}
 
 	state.TotalRuns += result.TotalDelta
@@ -472,6 +530,49 @@ func processScheduleFire(ctx workflow.Context, logger *zap.Logger, input *Schedu
 		logger.Info("schedule fire skipped",
 			zap.Time("scheduledTime", scheduledTime),
 		)
+	}
+	return fireOutcomeDone
+}
+
+// enqueueBufferedFire appends a fire to state.BufferedFires, enforcing the
+// buffer_limit policy. A buffer_limit of 0 means unlimited (per ERD). When the
+// limit is exceeded the fire is dropped and counted as skipped so operators
+// can monitor drops via scheduler_fire_skipped_per_domain{overlap_policy=BUFFER}.
+func enqueueBufferedFire(logger *zap.Logger, input *SchedulerWorkflowInput, state *SchedulerWorkflowState, scheduledTime time.Time, trigger TriggerSource) {
+	limit := int(input.Policies.BufferLimit)
+	if limit > 0 && len(state.BufferedFires) >= limit {
+		state.SkippedRuns++
+		logger.Warn("buffer limit reached; dropping fire",
+			zap.Time("scheduledTime", scheduledTime),
+			zap.Int("bufferLimit", limit),
+			zap.Int("bufferSize", len(state.BufferedFires)),
+		)
+		return
+	}
+	state.BufferedFires = append(state.BufferedFires, BufferedFire{
+		ScheduledTime: scheduledTime,
+		TriggerSource: trigger,
+	})
+	logger.Info("schedule fire buffered",
+		zap.Time("scheduledTime", scheduledTime),
+		zap.Int("bufferSize", len(state.BufferedFires)),
+	)
+}
+
+// drainBufferedFires attempts to execute queued fires in FIFO order. Stops as
+// soon as the head fire re-buffers (previous still running) so the queue head
+// never regresses. Any queued fire can be safely retried because the activity's
+// WorkflowID and RequestID are derived from the original scheduledTime +
+// triggerSource, so the server de-duplicates on replay.
+func drainBufferedFires(ctx workflow.Context, logger *zap.Logger, input *SchedulerWorkflowInput, state *SchedulerWorkflowState) {
+	for len(state.BufferedFires) > 0 {
+		head := state.BufferedFires[0]
+		if tryStartFire(ctx, logger, input, state, head.ScheduledTime, head.TriggerSource) == fireOutcomeBuffered {
+			// Previous workflow is still running; leave the head in place and
+			// stop draining. Subsequent iterations will retry.
+			return
+		}
+		state.BufferedFires = state.BufferedFires[1:]
 	}
 }
 
